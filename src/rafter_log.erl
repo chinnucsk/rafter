@@ -5,7 +5,7 @@
 -include("rafter.hrl").
 
 %% API
--export([start/0, stop/0, start_link/1, append/1, append/2, 
+-export([start_link/1, append/1, append/2, binary_to_entry/1, entry_to_binary/1,
         get_last_entry/0, get_last_entry/1, get_entry/1, get_entry/2,
         get_term/1, get_term/2, get_last_index/0, get_last_index/1, 
         get_last_term/0, get_last_term/1, truncate/1, truncate/2,
@@ -16,24 +16,66 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3, format_status/2]).
 
-%% TODO: Make this a persistent log (bitcask?)
+%%============================================================================= 
+%% Logfile Structure
+%%============================================================================= 
+%%@doc A log is made up of entries. Each entry is a binary of arbitrary size. However,
+%%     the format of an entry is fixed. It's described below.
+%%
+%%     Entry File format
+%%     ----------------
+%%     <<Sha1:20/binary, Type:8, Term:64, DataSize:32, Data/binary>> 
+%%
+%%     Sha1 - hash of the rest of the entry,
+%%     Type - ?CONFIG | ?OP | ?VOTE
+%%     Term - The current raft term
+%%     DataSize - The size of Data in bytes
+%%     Data - Data encoded with term_to_binary/1
+%%
 -record(state, {
+    file :: file:io_device(),
+    entries :: [],
     config :: #config{},
-    entries = [] :: [#rafter_entry{}],
     current_term = 0 :: non_neg_integer(),
     voted_for :: term()}).
+
+%% Entry Types
+-define(CONFIG, 1).
+-define(OP, 2).
+-define(VOTE, 3).
 
 %%====================================================================
 %% API
 %%====================================================================
-start() ->
-    gen_server:start({local, ?MODULE}, ?MODULE, [], []).
+entry_to_binary(#rafter_entry{type=config, term=Term, cmd=Data}) ->
+    entry_to_binary(?CONFIG, Term, Data);
+entry_to_binary(#rafter_entry{type=op, term=Term, cmd=Data}) ->
+    entry_to_binary(?OP, Term, Data);
+entry_to_binary(#rafter_entry{type=vote, term=Term, cmd=Data}) ->
+    entry_to_binary(?VOTE, Term, Data).
 
-stop() ->
-    gen_server:cast(?MODULE, stop).
+entry_to_binary(Type, Term, Data) ->
+    BinData = term_to_binary(Data),
+    B0 = <<Type:8, Term:64, (byte_size(BinData)):32, BinData/binary>>,
+    Sha1 = crypto:hash(sha, B0),
+    <<Sha1/binary, B0/binary>>.
+
+binary_to_entry(<<Sha1:20/binary, Type:8, Term:64, Size:32, Data/binary>>) ->
+    %% We want to crash on badmatch here if if our log is corrupt 
+    %% TODO: Allow an operator to repair the log by truncating at that point
+    %% or repair each entry 1 by 1 by consulting a good log.
+    Sha1 = crypto:hash(sha, <<Type:8, Term:64, Size:32, Data/binary>>),
+    binary_to_entry(Type, Term, Data).
+
+binary_to_entry(?CONFIG, Term, Data) ->
+    #rafter_entry{type=config, term=Term, cmd=binary_to_term(Data)};
+binary_to_entry(?OP, Term, Data) ->
+    #rafter_entry{type=op, term=Term, cmd=binary_to_term(Data)};
+binary_to_entry(?VOTE, Term, Data) ->
+    #rafter_entry{type=vote, term=Term, cmd=binary_to_term(Data)}.
 
 start_link(Name) ->
-    gen_server:start_link({local, Name}, ?MODULE, [], []).
+    gen_server:start_link({local, Name}, ?MODULE, [Name], []).
 
 append(Entries) ->
     gen_server:call(?MODULE, {append, Entries}).
@@ -115,8 +157,9 @@ truncate(Name, Index) ->
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
-init([]) ->
-    {ok, #state{entries = [],
+init([Name]) ->
+    {ok, File} = file:open("rafter_"++atom_to_list(Name)++".log", [append, read]),
+    {ok, #state{file=File,
                 config=#config{state=blank, 
                                oldservers=[], 
                                newservers=[]}}}.

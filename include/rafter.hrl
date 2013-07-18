@@ -34,7 +34,7 @@
             success :: boolean()}).
 
 -record(rafter_entry, {
-        type :: config | atom(),
+        type :: config | op,
         term :: non_neg_integer(),
         cmd :: term()}).
 
