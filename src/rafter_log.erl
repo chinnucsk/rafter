@@ -22,29 +22,48 @@
 %%@doc A log is made up of entries. Each entry is a binary of arbitrary size. However,
 %%     the format of an entry is fixed. It's described below.
 %%
-%%     Entry File format
-%%     ----------------
-%%     <<Sha1:20/binary, Type:8, Term:64, DataSize:32, Data/binary>> 
+%%         Entry Format
+%%         ----------------
+%%         <<Sha1:20/binary, Type:8, Term:64, DataSize:32, Data/binary>> 
+%%    
+%%         Sha1 - hash of the rest of the entry,
+%%         Type - ?CONFIG | ?OP | ?META
+%%         Term - The current raft term
+%%         DataSize - The size of Data in bytes
+%%         Data - Data encoded with term_to_binary/1
+%%    
+%%     After each log entry a trailer is written. The trailer is used for 
+%%     detecting incomplete/corrupted writes, pointing to metadata and
+%%     traversing the log file backwards.
 %%
-%%     Sha1 - hash of the rest of the entry,
-%%     Type - ?CONFIG | ?OP | ?VOTE
-%%     Term - The current raft term
-%%     DataSize - The size of Data in bytes
-%%     Data - Data encoded with term_to_binary/1
+%%         Trailer Format
+%%         ----------------
+%%         <<Crc:32, MetadataPtr:64, Start:64, <<"\xFE\xED\xFE\xED">> >>
 %%
+%%         Crc - crc32 of the rest of the trailer
+%%         MetadataPtr - file location of the metadata entry
+%%         Start - file location of the start of this entry
+%%         <<"\xFE\xED\xFE\xED">> - magic number marking the end of the trailer.
+%%                                  A fully consistent log should always have
+%%                                  this magic number as the last 8 bytes.
+
 -record(state, {
     file :: file:io_device(),
-    entries :: [],
+    write_location = 0 :: non_neg_integer(),
+    meta_location = 0 :: non_neg_integer(),
     config :: #config{},
-    current_term = 0 :: non_neg_integer(),
+    index = 0 :: non_neg_integer(),
+    term = 0 :: non_neg_integer(),
     voted_for :: term()}).
 
+-define(MAGIC, <<"\xFE\xED\xFE\xED">>).
 -define(HEADER_SIZE, 33).
+-define(TRAILER_SIZE, 28).
 
 %% Entry Types
 -define(CONFIG, 1).
 -define(OP, 2).
--define(VOTE, 3).
+-define(META, 3).
 
 %%====================================================================
 %% API
@@ -53,8 +72,8 @@ entry_to_binary(#rafter_entry{type=config, term=Term, cmd=Data}) ->
     entry_to_binary(?CONFIG, Term, Data);
 entry_to_binary(#rafter_entry{type=op, term=Term, cmd=Data}) ->
     entry_to_binary(?OP, Term, Data);
-entry_to_binary(#rafter_entry{type=vote, term=Term, cmd=Data}) ->
-    entry_to_binary(?VOTE, Term, Data).
+entry_to_binary(#rafter_entry{type=meta, term=Term, cmd=Data}) ->
+    entry_to_binary(?META, Term, Data).
 
 entry_to_binary(Type, Term, Data) ->
     BinData = term_to_binary(Data),
@@ -73,8 +92,8 @@ binary_to_entry(?CONFIG, Term, Data) ->
     #rafter_entry{type=config, term=Term, cmd=binary_to_term(Data)};
 binary_to_entry(?OP, Term, Data) ->
     #rafter_entry{type=op, term=Term, cmd=binary_to_term(Data)};
-binary_to_entry(?VOTE, Term, Data) ->
-    #rafter_entry{type=vote, term=Term, cmd=binary_to_term(Data)}.
+binary_to_entry(?META, Term, Data) ->
+    #rafter_entry{type=meta, term=Term, cmd=binary_to_term(Data)}.
 
 start_link(Name) ->
     gen_server:start_link({local, Name}, ?MODULE, [Name], []).
@@ -169,11 +188,16 @@ format_status(_, [_, State]) ->
     Data = lager:pr(State, ?MODULE),
     [{data, [{"StateData", Data}]}].
 
-handle_call({append, NewEntries}, _From, #state{entries=OldEntries, config=C}=State) ->
-    Config = find_config(NewEntries, C),
-    Entries = NewEntries ++ OldEntries,
-    Index = length(Entries),
-    {reply, {ok, Index}, State#state{entries=Entries, config=Config}};
+handle_call({append, Entries}, _From, 
+            #state{file=File, config=C, index=I, 
+                   write_location=Loc, meta_location=MLoc}=State) ->
+    Config = find_config(Entries, C),
+    {NewLoc, NumWritten} = write_entries(File, Entries, Loc, MLoc),
+    Index = I + NumWritten,
+    NewState = State#state{index=Index, 
+                           config=Config, 
+                           write_location=NewLoc},
+    {reply, {ok, Index}, NewState};
 
 handle_call(get_config, _From, #state{config=Config}=State) ->
     {reply, Config, State};
@@ -184,7 +208,7 @@ handle_call(get_last_entry, _From, #state{entries=[H | _T]}=State) ->
     {reply, {ok, H}, State};
 
 handle_call(get_last_index, _From, #state{entries=Entries}=State) ->
-    {reply, length(Entries), State};
+    {reply, Index, State};
 
 handle_call({set_voted_for, VotedFor}, _From, State) ->
     {reply, ok, State#state{voted_for=VotedFor}};
@@ -192,8 +216,8 @@ handle_call(get_voted_for, _From, #state{voted_for=VotedFor}=State) ->
     {reply, {ok, VotedFor}, State};
 
 handle_call({set_current_term, Term}, _From, State) ->
-    {reply, ok, State#state{current_term=Term}};
-handle_call(get_current_term, _From, #state{current_term=Term}=State) ->
+    {reply, ok, State#state{term=Term}};
+handle_call(get_current_term, _From, #state{term=Term}=State) ->
     {reply, {ok, Term}, State};
 
 handle_call({get_entry, Index}, _From, #state{entries=Entries}=State) ->
@@ -232,6 +256,32 @@ code_change(_OldVsn, State, _Extra) ->
 %%====================================================================
 %% Internal Functions 
 %%====================================================================
+
+make_trailer(EntryStart, MetadataStart) ->
+    T0 = <<MetadataStart:64, EntryStart:64, ?MAGIC>>,
+    Crc = erlang:crc32(T0),
+    <<Crc:32, T0>>.
+
+write_entries(File, Entries, Location, MetaLocation) ->
+    lists:foldl(fun(#rafter_entry{type=Type}=E, {Loc, Count) ->
+        Entry = entry_to_binary(E),
+        Trailer = make_trailer(Loc, MetaLocation),
+        ok = file:write(File, <<Entry/binary, Trailer/binary>>),
+        NewLoc = Loc + byte_size(Entry) + byte_size(Trailer),
+        case counts_toward_index(E) of
+            true ->
+                {NewLoc, Count + 1};
+            false ->
+                {NewLoc, Count}
+        end
+    end, {Location, 0}, Entries).
+
+counts_toward_index(#rafter_entry{type=config}) ->
+    true;
+counts_toward_index(#rafter_entry{type=op}) ->
+    true;
+counts_toward_index(_) ->
+    false.
 
 init_config(File) ->
     case find_latest_config(File) of
