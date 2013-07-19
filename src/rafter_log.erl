@@ -252,7 +252,7 @@ scan_latest(File, Location, Type) ->
 scan_latest(File, Location, Type, Acc) ->
     case read_entry(File, Location, [Type]) of
             eof ->
-                binary_to_term(Acc);
+                binary_to_entry(Acc);
             {entry, Entry, NewLoc} ->
                 scan_latest(File, NewLoc, Type, Entry);
             {skip, NewLoc} ->
