@@ -39,6 +39,8 @@
     current_term = 0 :: non_neg_integer(),
     voted_for :: term()}).
 
+-define(HEADER_SIZE, 33).
+
 %% Entry Types
 -define(CONFIG, 1).
 -define(OP, 2).
@@ -158,12 +160,11 @@ truncate(Name, Index) ->
 %% gen_server callbacks
 %%====================================================================
 init([Name]) ->
-    {ok, File} = file:open("rafter_"++atom_to_list(Name)++".log", [append, read]),
+    {ok, File} = file:open("rafter_"++atom_to_list(Name)++".log", 
+                           [append, read, binary]),
     {ok, #state{file=File,
-                config=#config{state=blank, 
-                               oldservers=[], 
-                               newservers=[]}}}.
-
+                config=init_config(File)}}.
+        
 format_status(_, [_, State]) ->
     Data = lager:pr(State, ?MODULE),
     [{data, [{"StateData", Data}]}].
@@ -231,10 +232,72 @@ code_change(_OldVsn, State, _Extra) ->
 %%====================================================================
 %% Internal Functions 
 %%====================================================================
+
+init_config(File) ->
+    case find_latest_config(File) of
+        {ok, Config} ->
+            Config;
+        not_found ->
+            #config{state=blank,
+                    oldservers=[],
+                    newservers=[]}
+    end.
+
+find_latest_config(File) ->
+    {ok, scan_latest(File, 0, ?CONFIG)}.
+
+scan_latest(File, Location, Type) ->
+    scan_latest(File, Location, Type, not_found).
+
+scan_latest(File, Location, Type, Acc) ->
+    case read_entry(File, Location, [Type]) of
+            eof ->
+                binary_to_term(Acc);
+            {entry, Entry, NewLoc} ->
+                scan_latest(File, NewLoc, Type, Entry);
+            {skip, NewLoc} ->
+                scan_latest(File, NewLoc, Type, Acc)
+    end.
+
+%% @doc This function reads the next entry from the log at the given location.
+%% It returns the {entry, Entry, NewLocation} if it's one of the requested 
+%% types. Otherwise, it returns {skip, NewLocation} where newLocation is the 
+%% location of the next entry in the log. If the end of file has been reached 
+%% return eof to the client. Errors are fail-fast.
+-spec read_entry(file:io_device(), non_neg_integer(), [non_neg_integer()]) ->
+    {entry, binary(), non_neg_integer()} | {skip, non_neg_integer()} | eof.
+read_entry(File, Location, Types) ->
+    case file:pread(File, Location, ?HEADER_SIZE) of
+        {ok, <<_Sha1:20/binary, Type:8, _Term:64, DataSize:32>>}=Header ->
+            case lists:member(Type, Types) of
+                true ->
+                    read_data(File, Location + ?HEADER_SIZE, Header);
+                false ->
+                    NewLocation = Location + ?HEADER_SIZE + DataSize,
+                    {skip, NewLocation}
+            end;
+        eof ->
+            eof
+    end.
+
+-spec read_data(file:io_device(), non_neg_integer(), binary()) ->
+    {entry, binary(), non_neg_integer()} | eof.
+read_data(File, Location, <<Sha1:20/binary, Type:8, Term:64, Size:32>>=H) ->
+    case file:pread(File, Location + ?HEADER_SIZE, Size) of 
+        {ok, Data} ->
+            %% Fail-fast Integrity check. TODO: Offer user repair options?
+            Sha1 = crypto:hash(sha, <<Type:8, Term:64, Size:32, Data/binary>>),
+            NewLocation = Location + ?HEADER_SIZE + Size,
+            {entry, <<H/binary, Data/binary>>, NewLocation};
+        eof ->
+            eof
+    end.
+
 find_config(Entries, CurrentConfig) ->
-    lists:foldl(fun(#rafter_entry{type=config, cmd=Config}, _) ->
-                      Config;
-                   (_, Acc) ->
-                      Acc
-                end, CurrentConfig, Entries).
+    lists:foldl(
+        fun(#rafter_entry{type=config, cmd=Config}, _) ->
+                Config;
+            (_, Acc) ->
+                Acc
+        end, CurrentConfig, Entries).
 
