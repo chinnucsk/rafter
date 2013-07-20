@@ -2,6 +2,8 @@
 
 -behaviour(gen_server).
 
+-include_lib("kernel/include/file.hrl").
+
 -include("rafter.hrl").
 
 %% API
@@ -46,24 +48,33 @@
 %%         <<"\xFE\xED\xFE\xED">> - magic number marking the end of the trailer.
 %%                                  A fully consistent log should always have
 %%                                  this magic number as the last 8 bytes.
+%%
 
 -record(state, {
     file :: file:io_device(),
     write_location = 0 :: non_neg_integer(),
     meta_location = 0 :: non_neg_integer(),
     config :: #config{},
+    meta :: #meta{},
     index = 0 :: non_neg_integer(),
-    term = 0 :: non_neg_integer(),
-    voted_for :: term()}).
+    term = 0 :: non_neg_integer()}).
+
+-record(meta, {
+    voted_for :: peer(),
+    voted_for_term :: non_neg_integer(),
+    config_location :: non_neg_integer()
+    }).
 
 -define(MAGIC, <<"\xFE\xED\xFE\xED">>).
 -define(HEADER_SIZE, 33).
 -define(TRAILER_SIZE, 28).
+-define(READ_BLOCK_SIZE, 1048576). %% 1MB
 
 %% Entry Types
 -define(CONFIG, 1).
 -define(OP, 2).
 -define(META, 3).
+-define(ALL, [?CONFIG, ?OP, ?META]).
 
 %%====================================================================
 %% API
@@ -178,12 +189,19 @@ truncate(Name, Index) ->
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
+
 init([Name]) ->
-    {ok, File} = file:open("rafter_"++atom_to_list(Name)++".log", 
-                           [append, read, binary]),
+    Filename = "rafter_"++atom_to_list(Name)++".log",
+    {ok, File} = file:open(Filename, [append, read, binary]),
+    {ok, #file_info{size=Size}} = read_file_info(Filename),
+    {MetaLocation, Meta, Config, Term} = init_file(File, Size),
     {ok, #state{file=File,
-                config=init_config(File)}}.
-        
+                write_location=Size,
+                meta_location=MetaLocation,
+                term=Term,
+                meta=Meta,
+                config=Config}}.
+
 format_status(_, [_, State]) ->
     Data = lager:pr(State, ?MODULE),
     [{data, [{"StateData", Data}]}].
@@ -257,17 +275,28 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Functions 
 %%====================================================================
 
+init_file(File, Size) ->
+    case repair_file(File, Size) of
+        {ok, MetaLocation, Term} ->
+            {ok, Meta} = read_metadata(File, MetaLocation),
+            {ok, Config} = read_config(File, ConfigLoc),
+            {MetaLocation, Meta, Config, Term};
+        empty_file ->
+            {0, undefined, undefined, 0}
+    end.
+
 make_trailer(EntryStart, MetadataStart) ->
     T0 = <<MetadataStart:64, EntryStart:64, ?MAGIC>>,
     Crc = erlang:crc32(T0),
     <<Crc:32, T0>>.
 
 write_entries(File, Entries, Location, MetaLocation) ->
-    lists:foldl(fun(#rafter_entry{type=Type}=E, {Loc, Count) ->
+    lists:foldl(fun(#rafter_entry{term=Term, type=Type}=E, {Loc, Count) ->
         Entry = entry_to_binary(E),
         Trailer = make_trailer(Loc, MetaLocation),
         ok = file:write(File, <<Entry/binary, Trailer/binary>>),
-        NewLoc = Loc + byte_size(Entry) + byte_size(Trailer),
+        NewLoc = Loc + byte_size(Entry) + ?TRAILER_SIZE,
+        update_metadata_config(File, Term, MetaLocation, Loc, NewLoc)
         case counts_toward_index(E) of
             true ->
                 {NewLoc, Count + 1};
@@ -276,6 +305,11 @@ write_entries(File, Entries, Location, MetaLocation) ->
         end
     end, {Location, 0}, Entries).
 
+update_metadata_config(File, Term, MetaStart, ConfigStart, End) ->
+    {ok, Meta} = read_metadata(File, MetaStart),
+    NewMeta = Meta#meta{config_location=ConfigStart},
+    write_metadata(File, Term, End, NewMeta).
+
 counts_toward_index(#rafter_entry{type=config}) ->
     true;
 counts_toward_index(#rafter_entry{type=op}) ->
@@ -283,14 +317,112 @@ counts_toward_index(#rafter_entry{type=op}) ->
 counts_toward_index(_) ->
     false.
 
-init_config(File) ->
-    case find_latest_config(File) of
-        {ok, Config} ->
-            Config;
+read_config(File, Loc) ->
+    {entry, Data, _} = read_entry(File, Location, [?CONFIG]),
+    #rafter_entry{type=config, cmd=Config} = binary_to_entry(Data),
+    {ok, Config}.
+
+write_metadata(File, Term, Loc, Meta) ->
+    E = #rafter_entry{type=meta, term=Term, cmd=Meta},
+    Entry = entry_to_binary(E),
+    %% Loc is both the start of the entry and the start of the metadata
+    Trailer = make_trailer(Loc, Loc),
+    ok = file:write(File, <<Entry/binary, Trailer/binary>>).
+
+read_metadata(File, Loc) ->
+    {entry, Data, _} = read_entry(File, Location, [?META]),
+    #rafter_entry{type=meta, cmd=Meta} = binary_to_entry(Data),
+    {ok, Meta}.
+
+truncate(File, Pos) ->
+    file:position(File, Pos),
+    file:truncate(File).
+
+maybe_truncate(File, TruncateAt, FileSize) ->
+    case TruncateAt < FileSize of
+        true ->
+            ok = truncate(File, TruncateAt);
+        false ->
+            ok
+    end.
+
+repair_file(File, Size) ->
+    case scan_for_trailer(File, Size) of
+        {ok, MetaStart, EntryStart, TruncateAt} ->
+            maybe_truncate(File, TruncateAt, Size),
+            {entry, Data, _} = read_entry(File, EntryStart, ?ALL),
+            #rafter_entry{type=Type, term=Term} = binary_to_entry(Data), 
+            case Type of
+                config ->
+                    %% At this point we must have written config and crashed before updating
+                    %% the metadata. A config entry must always be followed immediately by a
+                    %% metadata entry since metadata points to the latest config.
+                    update_metadata_config(File, Term, MetaStart, 
+                                           EntryStart, TruncateAt),
+                    {ok, TruncateAt, Term};
+                _ ->
+                    {ok, MetaStart, Term}
+            end;
         not_found ->
-            #config{state=blank,
-                    oldservers=[],
-                    newservers=[]}
+            truncate(File, 0),
+            empty_file
+    end.
+
+scan_for_trailer(File, Loc) ->
+    case find_magic_number(File, Loc) of
+        {ok, MagicLoc} ->
+            case file:pread(File, MagicLoc - (?TRAILER_SIZE-8), ?TRAILER_SIZE) of
+                {ok, <<Crc:32, MetaStart:64, EntryStart:64, ?MAGIC>>} ->
+                    case erlang:crc32(<<MetaStart:64, EntryStart:64, ?MAGIC>>) of
+                        Crc ->
+                            {ok, MetaStart, EntryStart, MagicLoc + 8};
+                        _ ->
+                            scan_for_trailer(File, MagicLoc)
+                    end;
+                eof ->
+                    not_found
+            end;
+        not_found ->
+            not_found
+    end.
+
+read_block(File, Loc) ->
+    case Loc < ?READ_BLOCK_SIZE of
+        true ->
+            {ok, Buffer} = file:pread(File, 0, Loc),
+            {Buffer, 0};
+        false ->
+            Start = Loc - ?READ_BLOCK_SIZE,
+            {ok, Buffer} = file:pread(File, Start, ?READ_BLOCK_SIZE),
+            {Buffer, Start}
+    end.
+
+%% @doc Continuously read blocks from the file and search backwards until the
+%% magic number is found or we reach the beginning of the file.
+find_magic_number(File, Loc) ->
+    {Block, Start} = read_block(File, Loc),
+    case find_last_magic_number_in_block(Block) of
+        {ok, Offset} ->
+            {ok, Loc+Offset};
+        not_found ->
+            case Start of
+                0 ->
+                    not_found;
+                _ ->
+                    %% Ensure we search the overlapping 8 bytes between blocks
+                    find_magic_number(File, Start+8)
+            end
+    end.
+
+-spec find_last_magic_number_in_block(binary()) ->
+    {ok, non_neg_integer()} | not_found.
+find_last_magic_number_in_block(Block) ->
+    case string:rstr(bin_to_list(Block), bin_to_list(?MAGIC)) of
+        0 ->
+            not_found;
+        Index ->
+            %% We want the 0 based binary offset, not the 1 based list offset.
+            {ok, Index - 1}
     end.
 
 find_latest_config(File) ->
