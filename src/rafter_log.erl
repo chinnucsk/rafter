@@ -26,11 +26,12 @@
 %%
 %%         Entry Format
 %%         ----------------
-%%         <<Sha1:20/binary, Type:8, Term:64, DataSize:32, Data/binary>> 
+%%         <<Sha1:20/binary, Type:8, Term:64, Index: 64, DataSize:32, Data/binary>> 
 %%    
 %%         Sha1 - hash of the rest of the entry,
-%%         Type - ?CONFIG | ?OP | ?META
-%%         Term - The current raft term
+%%         Type - ?CONFIG | ?OP 
+%%         Term - The term of the entry
+%%         Index - The log index of the entry
 %%         DataSize - The size of Data in bytes
 %%         Data - Data encoded with term_to_binary/1
 %%    
@@ -40,20 +41,20 @@
 %%
 %%         Trailer Format
 %%         ----------------
-%%         <<Crc:32, MetadataPtr:64, Start:64, <<"\xFE\xED\xFE\xED">> >>
-%%
-%%         Crc - crc32 of the rest of the trailer
-%%         MetadataPtr - file location of the metadata entry
-%%         Start - file location of the start of this entry
-%%         <<"\xFE\xED\xFE\xED">> - magic number marking the end of the trailer.
-%%                                  A fully consistent log should always have
-%%                                  this magic number as the last 8 bytes.
+%%         <<Crc:32, ConfigStart:64, EntryStart:64, ?MAGIC:64>>
+%%         
+%%         Crc - checksum, computed with erlang:crc32/1, of the rest of the trailer
+%%         ConfigStart - file location of last seen config,
+%%         EntryStart - file location of the start of this entry
+%%         ?MAGIC - magic number marking the end of the trailer.
+%%                  A fully consistent log should always have
+%%                  the following magic number as the last 8 bytes:
+%%                  <<"\xFE\xED\xFE\xED\xFE\xED\xFE\xED">>
 %%
 
 -record(state, {
-    file :: file:io_device(),
+    logfile :: file:io_device(),
     write_location = 0 :: non_neg_integer(),
-    meta_location = 0 :: non_neg_integer(),
     config :: #config{},
     meta :: #meta{},
     index = 0 :: non_neg_integer(),
@@ -61,50 +62,43 @@
 
 -record(meta, {
     voted_for :: peer(),
-    voted_for_term :: non_neg_integer(),
-    config_location :: non_neg_integer()
-    }).
+    voted_for_term :: non_neg_integer()}).
 
--define(MAGIC, <<"\xFE\xED\xFE\xED">>).
--define(HEADER_SIZE, 33).
--define(TRAILER_SIZE, 28).
+-define(MAGIC, <<"\xFE\xED\xFE\xED\xFE\xED\xFE\xED">>).
+-define(HEADER_SIZE, 41).
+-define(TRAILER_SIZE, 16).
 -define(READ_BLOCK_SIZE, 1048576). %% 1MB
 
 %% Entry Types
 -define(CONFIG, 1).
 -define(OP, 2).
--define(META, 3).
--define(ALL, [?CONFIG, ?OP, ?META]).
+-define(ALL, [?CONFIG, ?OP]).
 
 %%====================================================================
 %% API
 %%====================================================================
-entry_to_binary(#rafter_entry{type=config, term=Term, cmd=Data}) ->
+entry_to_binary(#rafter_entry{type=config, term=Term, index=Index, cmd=Data}) ->
     entry_to_binary(?CONFIG, Term, Data);
-entry_to_binary(#rafter_entry{type=op, term=Term, cmd=Data}) ->
-    entry_to_binary(?OP, Term, Data);
-entry_to_binary(#rafter_entry{type=meta, term=Term, cmd=Data}) ->
-    entry_to_binary(?META, Term, Data).
+entry_to_binary(#rafter_entry{type=op, term=Term, index=Index, cmd=Data}) ->
+    entry_to_binary(?OP, Term, Data).
 
-entry_to_binary(Type, Term, Data) ->
+entry_to_binary(Type, Term, Index, Data) ->
     BinData = term_to_binary(Data),
-    B0 = <<Type:8, Term:64, (byte_size(BinData)):32, BinData/binary>>,
+    B0 = <<Type:8, Term:64, Index:64, (byte_size(BinData)):32, BinData/binary>>,
     Sha1 = crypto:hash(sha, B0),
     <<Sha1/binary, B0/binary>>.
 
-binary_to_entry(<<Sha1:20/binary, Type:8, Term:64, Size:32, Data/binary>>) ->
+binary_to_entry(<<Sha1:20/binary, Type:8, Term:64, Index:64, Size:32, Data/binary>>) ->
     %% We want to crash on badmatch here if if our log is corrupt 
     %% TODO: Allow an operator to repair the log by truncating at that point
     %% or repair each entry 1 by 1 by consulting a good log.
-    Sha1 = crypto:hash(sha, <<Type:8, Term:64, Size:32, Data/binary>>),
-    binary_to_entry(Type, Term, Data).
+    Sha1 = crypto:hash(sha, <<Type:8, Term:64, Index:64, Size:32, Data/binary>>),
+    binary_to_entry(Type, Term, Index, Data).
 
-binary_to_entry(?CONFIG, Term, Data) ->
-    #rafter_entry{type=config, term=Term, cmd=binary_to_term(Data)};
-binary_to_entry(?OP, Term, Data) ->
-    #rafter_entry{type=op, term=Term, cmd=binary_to_term(Data)};
-binary_to_entry(?META, Term, Data) ->
-    #rafter_entry{type=meta, term=Term, cmd=binary_to_term(Data)}.
+binary_to_entry(?CONFIG, Term, Index, Data) ->
+    #rafter_entry{type=config, term=Term, index=Index, cmd=binary_to_term(Data)};
+binary_to_entry(?OP, Term, Index, Data) ->
+    #rafter_entry{type=op, term=Term, index=Index, cmd=binary_to_term(Data)}.
 
 start_link(Name) ->
     gen_server:start_link({local, Name}, ?MODULE, [Name], []).
@@ -191,14 +185,16 @@ truncate(Name, Index) ->
 %%====================================================================
 
 init([Name]) ->
-    Filename = "rafter_"++atom_to_list(Name)++".log",
-    {ok, File} = file:open(Filename, [append, read, binary]),
+    %% TODO: fix this path 
+    LogName = "rafter_"++atom_to_list(Name)++".log",
+    {ok, LogFile} = file:open(LogName, [append, read, binary]),
     {ok, #file_info{size=Size}} = read_file_info(Filename),
-    {MetaLocation, Meta, Config, Term} = init_file(File, Size),
-    {ok, #state{file=File,
-                write_location=Size,
-                meta_location=MetaLocation,
+    {ok, Meta} = read_metadata(Name),
+    {Config, Term, Index, WriteLocation} = init_file(File, Size),
+    {ok, #state{logfile=LogFile,
+                write_location=WriteLocation,
                 term=Term,
+                index=Index
                 meta=Meta,
                 config=Config}}.
 
@@ -277,18 +273,17 @@ code_change(_OldVsn, State, _Extra) ->
 
 init_file(File, Size) ->
     case repair_file(File, Size) of
-        {ok, MetaLocation, Term} ->
-            {ok, Meta} = read_metadata(File, MetaLocation),
+        {ok, ConfigLoc, Term, Index, WriteLoc} ->
             {ok, Config} = read_config(File, ConfigLoc),
-            {MetaLocation, Meta, Config, Term};
+            {Config, Term, Index, WriteLoc};
         empty_file ->
-            {0, undefined, undefined, 0}
+            {#config{}, 0, 0, 0}
     end.
 
-make_trailer(EntryStart, MetadataStart) ->
-    T0 = <<MetadataStart:64, EntryStart:64, ?MAGIC>>,
+make_trailer(EntryStart, ConfigStart) ->
+    T = <<ConfigStart:64, EntryStart:64, ?MAGIC>>,
     Crc = erlang:crc32(T0),
-    <<Crc:32, T0>>.
+    <<Crc:32, T/binary>>.
 
 write_entries(File, Entries, Location, MetaLocation) ->
     lists:foldl(fun(#rafter_entry{term=Term, type=Type}=E, {Loc, Count) ->
@@ -304,11 +299,6 @@ write_entries(File, Entries, Location, MetaLocation) ->
                 {NewLoc, Count}
         end
     end, {Location, 0}, Entries).
-
-update_metadata_config(File, Term, MetaStart, ConfigStart, End) ->
-    {ok, Meta} = read_metadata(File, MetaStart),
-    NewMeta = Meta#meta{config_location=ConfigStart},
-    write_metadata(File, Term, End, NewMeta).
 
 counts_toward_index(#rafter_entry{type=config}) ->
     true;
@@ -329,10 +319,16 @@ write_metadata(File, Term, Loc, Meta) ->
     Trailer = make_trailer(Loc, Loc),
     ok = file:write(File, <<Entry/binary, Trailer/binary>>).
 
-read_metadata(File, Loc) ->
-    {entry, Data, _} = read_entry(File, Location, [?META]),
-    #rafter_entry{type=meta, cmd=Meta} = binary_to_entry(Data),
-    {ok, Meta}.
+read_metadata(Name) ->
+    Filename = "rafter_"++atom_to_list(Name)++".meta",
+    case file:read_file(Filename) of
+        {ok, Bin} ->
+            {ok, binary_to_term(Bin)};
+        {error, Reason} ->
+            io:format("Failed to open metadata file: ~p. Reason = ~p~n", 
+                [Filename, Reason]),
+            {ok, #meta{}}
+    end.
 
 truncate(File, Pos) ->
     file:position(File, Pos),
@@ -348,21 +344,11 @@ maybe_truncate(File, TruncateAt, FileSize) ->
 
 repair_file(File, Size) ->
     case scan_for_trailer(File, Size) of
-        {ok, MetaStart, EntryStart, TruncateAt} ->
+        {ok, ConfigStart, EntryStart, TruncateAt} ->
             maybe_truncate(File, TruncateAt, Size),
             {entry, Data, _} = read_entry(File, EntryStart, ?ALL),
-            #rafter_entry{type=Type, term=Term} = binary_to_entry(Data), 
-            case Type of
-                config ->
-                    %% At this point we must have written config and crashed before updating
-                    %% the metadata. A config entry must always be followed immediately by a
-                    %% metadata entry since metadata points to the latest config.
-                    update_metadata_config(File, Term, MetaStart, 
-                                           EntryStart, TruncateAt),
-                    {ok, TruncateAt, Term};
-                _ ->
-                    {ok, MetaStart, Term}
-            end;
+            #rafter_entry{type=Type, term=Term, index=Index} = binary_to_entry(Data), 
+            {ok, ConfigStart, Term, Index, TruncateAt};
         not_found ->
             truncate(File, 0),
             empty_file
@@ -373,9 +359,9 @@ scan_for_trailer(File, Loc) ->
         {ok, MagicLoc} ->
             case file:pread(File, MagicLoc - (?TRAILER_SIZE-8), ?TRAILER_SIZE) of
                 {ok, <<Crc:32, MetaStart:64, EntryStart:64, ?MAGIC>>} ->
-                    case erlang:crc32(<<MetaStart:64, EntryStart:64, ?MAGIC>>) of
+                    case erlang:crc32(<<ConfigStart:64, EntryStart:64, ?MAGIC>>) of
                         Crc ->
-                            {ok, MetaStart, EntryStart, MagicLoc + 8};
+                            {ok, ConfigStart, EntryStart, MagicLoc + 8};
                         _ ->
                             scan_for_trailer(File, MagicLoc)
                     end;
