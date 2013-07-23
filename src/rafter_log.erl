@@ -11,8 +11,7 @@
         get_last_entry/0, get_last_entry/1, get_entry/1, get_entry/2,
         get_term/1, get_term/2, get_last_index/0, get_last_index/1, 
         get_last_term/0, get_last_term/1, truncate/1, truncate/2,
-        get_voted_for/1, set_voted_for/2, get_current_term/1, set_current_term/2,
-        get_config/1]).
+        get_config/1, set_metadata/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -36,7 +35,7 @@
 %%         Data - Data encoded with term_to_binary/1
 %%    
 %%     After each log entry a trailer is written. The trailer is used for 
-%%     detecting incomplete/corrupted writes, pointing to metadata and
+%%     detecting incomplete/corrupted writes, pointing to the latest config and
 %%     traversing the log file backwards.
 %%
 %%         Trailer Format
@@ -54,6 +53,7 @@
 
 -record(state, {
     logfile :: file:io_device(),
+    meta_filename :: string(),
     write_location = 0 :: non_neg_integer(),
     config :: #config{},
     meta :: #meta{},
@@ -62,7 +62,7 @@
 
 -record(meta, {
     voted_for :: peer(),
-    voted_for_term :: non_neg_integer()}).
+    term :: non_neg_integer()}).
 
 -define(MAGIC, <<"\xFE\xED\xFE\xED\xFE\xED\xFE\xED">>).
 -define(HEADER_SIZE, 41).
@@ -140,17 +140,8 @@ get_last_term(Name) ->
             0
     end.
 
-set_voted_for(Name, VotedFor) ->
-    gen_server:call(Name, {set_voted_for, VotedFor}).
-
-get_voted_for(Name) ->
-    gen_server:call(Name, get_voted_for).
-
-set_current_term(Name, CurrentTerm) ->
-    gen_server:call(Name, {set_current_term, CurrentTerm}).
-
-get_current_term(Name) ->
-    gen_server:call(Name, get_current_term).
+set_metadata(Name, VotedFor, Term) ->
+    gen_server:call(Name, {set_metadata, VotedFor, Term}).
 
 get_entry(Index) ->
     gen_server:call(?MODULE, {get_entry, Index}).
@@ -187,11 +178,13 @@ truncate(Name, Index) ->
 init([Name]) ->
     %% TODO: fix this path 
     LogName = "rafter_"++atom_to_list(Name)++".log",
+    MetaName = "rafter_"++atom_to_list(Name)++".meta",
     {ok, LogFile} = file:open(LogName, [append, read, binary]),
     {ok, #file_info{size=Size}} = read_file_info(Filename),
-    {ok, Meta} = read_metadata(Name),
+    {ok, Meta} = read_metadata(MetaName),
     {Config, Term, Index, WriteLocation} = init_file(File, Size),
     {ok, #state{logfile=LogFile,
+                meta_filename=MetaName,
                 write_location=WriteLocation,
                 term=Term,
                 index=Index
@@ -204,10 +197,9 @@ format_status(_, [_, State]) ->
 
 handle_call({append, Entries}, _From, 
             #state{file=File, config=C, index=I, 
-                   write_location=Loc, meta_location=MLoc}=State) ->
+                   write_location=Loc}=State) ->
     Config = find_config(Entries, C),
-    {NewLoc, NumWritten} = write_entries(File, Entries, Loc, MLoc),
-    Index = I + NumWritten,
+    {NewLoc, Index} = write_entries(File, Entries, Loc, I),
     NewState = State#state{index=Index, 
                            config=Config, 
                            write_location=NewLoc},
@@ -224,15 +216,10 @@ handle_call(get_last_entry, _From, #state{entries=[H | _T]}=State) ->
 handle_call(get_last_index, _From, #state{entries=Entries}=State) ->
     {reply, Index, State};
 
-handle_call({set_voted_for, VotedFor}, _From, State) ->
-    {reply, ok, State#state{voted_for=VotedFor}};
-handle_call(get_voted_for, _From, #state{voted_for=VotedFor}=State) ->
-    {reply, {ok, VotedFor}, State};
-
-handle_call({set_current_term, Term}, _From, State) ->
-    {reply, ok, State#state{term=Term}};
-handle_call(get_current_term, _From, #state{term=Term}=State) ->
-    {reply, {ok, Term}, State};
+handle_call({set_metadata, VotedFor, Term}, _, #state{meta_filename=Name}=S) ->
+    Meta = #meta{voted_for=VotedFor, term=Term},
+    ok = write_metadata(Name, Meta),
+    {reply, ok, State{meta=Meta}};
 
 handle_call({get_entry, Index}, _From, #state{entries=Entries}=State) ->
     Entry = try 
@@ -285,20 +272,15 @@ make_trailer(EntryStart, ConfigStart) ->
     Crc = erlang:crc32(T0),
     <<Crc:32, T/binary>>.
 
-write_entries(File, Entries, Location, MetaLocation) ->
-    lists:foldl(fun(#rafter_entry{term=Term, type=Type}=E, {Loc, Count) ->
-        Entry = entry_to_binary(E),
+write_entries(File, Entries, Location, Index) ->
+    lists:foldl(fun(#rafter_entry{term=Term, type=Type}=E, {Loc, I) ->
+        NewIndex = I + 1,
+        Entry = entry_to_binary(E#rafter_entry{index=NewIndex}),
         Trailer = make_trailer(Loc, MetaLocation),
         ok = file:write(File, <<Entry/binary, Trailer/binary>>),
         NewLoc = Loc + byte_size(Entry) + ?TRAILER_SIZE,
-        update_metadata_config(File, Term, MetaLocation, Loc, NewLoc)
-        case counts_toward_index(E) of
-            true ->
-                {NewLoc, Count + 1};
-            false ->
-                {NewLoc, Count}
-        end
-    end, {Location, 0}, Entries).
+        {NewLoc, NewIndex}
+    end, {Location, Index}, Entries).
 
 counts_toward_index(#rafter_entry{type=config}) ->
     true;
@@ -312,15 +294,10 @@ read_config(File, Loc) ->
     #rafter_entry{type=config, cmd=Config} = binary_to_entry(Data),
     {ok, Config}.
 
-write_metadata(File, Term, Loc, Meta) ->
-    E = #rafter_entry{type=meta, term=Term, cmd=Meta},
-    Entry = entry_to_binary(E),
-    %% Loc is both the start of the entry and the start of the metadata
-    Trailer = make_trailer(Loc, Loc),
-    ok = file:write(File, <<Entry/binary, Trailer/binary>>).
+write_metadata(Filename, Meta) ->
+    ok = file:write_file(Filename, term_to_binary(Meta)).
 
-read_metadata(Name) ->
-    Filename = "rafter_"++atom_to_list(Name)++".meta",
+read_metadata(Filename) ->
     case file:read_file(Filename) of
         {ok, Bin} ->
             {ok, binary_to_term(Bin)};

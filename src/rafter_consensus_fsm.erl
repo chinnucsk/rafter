@@ -231,8 +231,7 @@ candidate(timeout, #state{term=CurrentTerm, me=Me}=State) ->
                            timer_start=os:timestamp(),
                            leader=undefined,
                            voted_for=Me},
-    ok = rafter_log:set_current_term(?logname(), NewTerm),
-    ok = rafter_log:set_voted_for(?logname(), Me),
+    ok = rafter_log:set_metadata(?logname, Me, NewTerm),
     request_votes(NewState),
     {next_state, candidate, NewState, Duration};
 
@@ -636,8 +635,7 @@ safe_to_commit(Index, #state{term=CurrentTerm}=State) ->
 
 %% We are about to transition to the follower state. Reset the necessary state.
 step_down(NewTerm, State) ->
-    ok = rafter_log:set_voted_for(?logname(), undefined),
-    ok = rafter_log:set_current_term(?logname(), NewTerm),
+    ok = rafter_log:set_metadata(?logname(), undefined, NewTerm),
     State#state{term=NewTerm,
                 responses=dict:new(),
                 timer_duration=election_timeout(),
@@ -659,8 +657,7 @@ handle_request_vote(#request_vote{from=CandidateId, term=Term}=RequestVote, Stat
     {ok, Vote} = vote(RequestVote, State2),
     case Vote#vote.success of
         true ->
-            ok = rafter_log:set_voted_for(?logname(), CandidateId),
-            ok = rafter_log:set_current_term(?logname(), State2#state.term),
+            ok = rafter_log:set_metadata(?logname(), CandidateId, State#state.term),
             Duration = election_timeout(),
             State3 = State2#state{voted_for=CandidateId, 
                                   timer_duration=Duration, 
@@ -761,8 +758,7 @@ consistency_check(#append_entries{prev_log_index=Index,
 set_term(Term, #state{term=CurrentTerm}=State) when Term < CurrentTerm ->
     State;
 set_term(Term, #state{term=CurrentTerm}=State) when Term > CurrentTerm ->
-    ok = rafter_log:set_current_term(?logname(), CurrentTerm),
-    ok = rafter_log:set_voted_for(?logname(), undefined),
+    ok = rafter_log:set_metadata(?logname(), undefined, CurrentTerm),
     State#state{term=Term, voted_for=undefined};
 set_term(Term, #state{term=Term}=State) ->
     State.
