@@ -231,7 +231,7 @@ candidate(timeout, #state{term=CurrentTerm, me=Me}=State) ->
                            timer_start=os:timestamp(),
                            leader=undefined,
                            voted_for=Me},
-    ok = rafter_log:set_metadata(?logname, Me, NewTerm),
+    ok = rafter_log:set_metadata(?logname(), Me, NewTerm),
     request_votes(NewState),
     {next_state, candidate, NewState, Duration};
 
