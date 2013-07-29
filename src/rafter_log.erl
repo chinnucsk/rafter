@@ -74,6 +74,7 @@
     term = 0 :: non_neg_integer()}).
 
 -define(MAGIC, <<"\xFE\xED\xFE\xED\xFE\xED\xFE\xED">>).
+-define(MAGIC_SIZE, 8).
 -define(HEADER_SIZE, 41).
 -define(TRAILER_SIZE, 28).
 -define(FILE_HEADER_SIZE, 1).
@@ -193,7 +194,7 @@ init([Name]) ->
     %% TODO: fix this path 
     LogName = "log/rafter_"++atom_to_list(Name)++".log",
     MetaName = "log/rafter_"++atom_to_list(Name)++".meta",
-    {ok, LogFile} = file:open(LogName, [append, read, binary]),
+    {ok, LogFile} = file:open(LogName, [append, read, binary, raw]),
     {ok, #file_info{size=Size}} = file:read_file_info(LogName),
     {ok, Meta} = read_metadata(MetaName, Size),
     {ConfigLoc, Config, Term, Index, WriteLocation, Version} = init_file(LogFile, Size),
@@ -216,10 +217,11 @@ format_status(_, [_, State]) ->
 handle_call({append, Entries}, _From, 
             #state{logfile=File, config=C, config_loc=CLoc, index=I, 
                    write_location=Loc}=State) ->
-    Config = find_config(Entries, C),
-    {NewLoc, Index, LastEntry} = write_entries(File, Entries, Loc, CLoc, I),
+    {NewLoc, Index, LastEntry, ConfigLoc, Config} 
+        = write_entries(File, Entries, Loc, CLoc, C, I),
     NewState = State#state{index=Index, 
                            config=Config, 
+                           config_loc=ConfigLoc,
                            write_location=NewLoc,
                            last_entry=LastEntry},
     {reply, {ok, Index}, NewState};
@@ -303,21 +305,22 @@ make_trailer(EntryStart, ConfigStart) ->
     Crc = erlang:crc32(T),
     <<Crc:32, T/binary>>.
 
-write_entries(File, Entries, Location, ConfigLoc, Index) ->
-    Res = lists:foldl(fun(#rafter_entry{type=Type}=E, {Loc, I, _}) ->
+write_entries(File, Entries, Location, ConfigLoc, Config0, Index) ->
+    Res = lists:foldl(fun(#rafter_entry{type=Type, cmd=Cmd}=E, {Loc, I, _, CLoc, C}) ->
         NewIndex = I + 1,
         Entry0 = E#rafter_entry{index=NewIndex}, 
         Entry = entry_to_binary(Entry0),
-        Trailer = case Type of 
-            config ->
-                make_trailer(Loc, ConfigLoc);
-            _ ->
-                make_trailer(Loc, Loc)
-        end,
+        {NewConfigLoc, Config, Trailer} = 
+            case Type of 
+                config ->
+                    {Loc, Cmd, make_trailer(Loc, Loc)};
+                _ ->
+                    {CLoc, C, make_trailer(Loc, ConfigLoc)}
+            end,
         ok = file:write(File, <<Entry/binary, Trailer/binary>>),
         NewLoc = Loc + byte_size(Entry) + ?TRAILER_SIZE,
-        {NewLoc, NewIndex, Entry0}
-    end, {Location, Index, undefined}, Entries),
+        {NewLoc, NewIndex, Entry0, NewConfigLoc, Config}
+    end, {Location, Index, undefined, ConfigLoc, Config0}, Entries),
     ok = file:sync(File),
     Res.
 
@@ -356,11 +359,14 @@ maybe_truncate(File, TruncateAt, FileSize) ->
 repair_file(File, Size) ->
     case scan_for_trailer(File, Size) of
         {ok, ConfigStart, EntryStart, TruncateAt} ->
+            io:format("AYO, maybe truncate?~n", []),
+            io:format("ConfigStart = ~p, EntryStart = ~p, TruncateAt = ~p~n", [ConfigStart, EntryStart, TruncateAt]),
             maybe_truncate(File, TruncateAt, Size),
             {entry, Data, _} = read_entry(File, EntryStart),
             #rafter_entry{term=Term, index=Index} = binary_to_entry(Data), 
             {ok, ConfigStart, Term, Index, TruncateAt};
         not_found ->
+            io:format("NOT FOUND: Size = ~p~n", [Size]),
             do_truncate(File, 0),
             empty_file
     end.
@@ -368,7 +374,7 @@ repair_file(File, Size) ->
 scan_for_trailer(File, Loc) ->
     case find_magic_number(File, Loc) of
         {ok, MagicLoc} ->
-            case file:pread(File, MagicLoc - (?TRAILER_SIZE-8), ?TRAILER_SIZE) of
+            case file:pread(File, MagicLoc - (?TRAILER_SIZE-?MAGIC_SIZE), ?TRAILER_SIZE) of
                 {ok, <<Crc:32, ConfigStart:64, EntryStart:64, _/binary >>} ->
                     case erlang:crc32(<<ConfigStart:64, EntryStart:64, ?MAGIC/binary >>) of
                         Crc ->
@@ -400,7 +406,8 @@ find_magic_number(File, Loc) ->
     {Block, Start} = read_block(File, Loc),
     case find_last_magic_number_in_block(Block) of
         {ok, Offset} ->
-            {ok, Loc+Offset};
+            io:format("Magic Number found at ~p~n", [Start+Offset]),
+            {ok, Start+Offset};
         not_found ->
             case Start of
                 0 ->
@@ -483,12 +490,3 @@ read_data(File, Location, <<Sha1:20/binary, Type:8, Term:64, Index:64, Size:32>>
         eof ->
             eof
     end.
-
-find_config(Entries, CurrentConfig) ->
-    lists:foldl(
-        fun(#rafter_entry{type=config, cmd=Config}, _) ->
-                Config;
-            (_, Acc) ->
-                Acc
-        end, CurrentConfig, Entries).
-
