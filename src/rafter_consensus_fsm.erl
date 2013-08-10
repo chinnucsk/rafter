@@ -4,12 +4,12 @@
 
 -include("rafter.hrl").
 -include("rafter_consensus_fsm.hrl").
+-include("rafter_opts.hrl").
 
 -define(CLIENT_TIMEOUT, 2000).
 -define(ELECTION_TIMEOUT_MIN, 150).
 -define(ELECTION_TIMEOUT_MAX, 300).
 -define(HEARTBEAT_TIMEOUT, 75).
--define(logname(), logname(State#state.me)).
 -define(timeout(), timeout(State#state.timer_start, State#state.timer_duration)).
 
 %% API
@@ -36,8 +36,8 @@ stop(Pid) ->
 start(Me) ->
     gen_fsm:start({local, Me}, ?MODULE, [Me], []).
 
-start_link(NameAtom, Me, StateMachine) ->
-    gen_fsm:start_link({local, NameAtom}, ?MODULE, [Me, StateMachine], []).
+start_link(NameAtom, Me, Opts) ->
+    gen_fsm:start_link({local, NameAtom}, ?MODULE, [Me, Opts], []).
     %%gen_fsm:start_link({local, NameAtom}, ?MODULE, [Me, StateMachine], [{debug, [trace]}]).
 
 -spec leader(peer()) -> peer() | undefined.
@@ -67,7 +67,7 @@ send_sync(To, Msg) ->
 %% gen_fsm callbacks 
 %%=============================================================================
 
-init([Me, StateMachine]) ->
+init([Me, #rafter_opts{state_machine=StateMachine}]) ->
     random:seed(),
     Duration = election_timeout(),
     State = #state{term=0,
@@ -77,7 +77,7 @@ init([Me, StateMachine]) ->
                    timer_start=os:timestamp(),
                    timer_duration = Duration,
                    state_machine=StateMachine},
-    NewState = State#state{config=rafter_log:get_config(?logname())},
+    NewState = State#state{config=rafter_log:get_config(Me)},
     {ok, follower, NewState, Duration}.
 
 format_status(_, [_, State]) ->
@@ -156,9 +156,9 @@ follower(#append_entries{term=Term, from=From, prev_log_index=PrevLogIndex,
         false ->
             {reply, Rpy, follower, State3, Duration};
         true ->
-            ok = rafter_log:truncate(?logname(), PrevLogIndex),
-            {ok, CurrentIndex}  = rafter_log:append(?logname(), Entries),
-            Config = rafter_log:get_config(?logname()),
+            ok = rafter_log:truncate(Me, PrevLogIndex),
+            {ok, CurrentIndex}  = rafter_log:append(Me, Entries),
+            Config = rafter_log:get_config(Me),
             NewRpy = Rpy#append_entries_rpy{success=true, index=CurrentIndex},
             State4 = commit_entries(CommitIndex, State3),
             State5 = State4#state{leader=From, config=Config},
@@ -231,7 +231,7 @@ candidate(timeout, #state{term=CurrentTerm, me=Me}=State) ->
                            timer_start=os:timestamp(),
                            leader=undefined,
                            voted_for=Me},
-    ok = rafter_log:set_metadata(?logname(), Me, NewTerm),
+    ok = rafter_log:set_metadata(Me, Me, NewTerm),
     request_votes(NewState),
     {next_state, candidate, NewState, Duration};
 
@@ -367,7 +367,7 @@ leader(#append_entries_rpy{from=From, success=false},
            true ->
                NextIndex = decrement_follower_index(From, Followers),
                NewState = State#state{followers=dict:store(From, NextIndex, Followers)},
-               LastLogIndex = rafter_log:get_last_index(?logname()),
+               LastLogIndex = rafter_log:get_last_index(Me),
                maybe_send_entry(From, NextIndex, LastLogIndex, NewState),
                {next_state, leader, NewState, ?timeout()};
            false ->
@@ -457,11 +457,11 @@ leader({op, {Id, Command }}, From,
 %% Internal Functions 
 %%=============================================================================
 
-send_next_entry(From, Followers, Responses, State) ->
+send_next_entry(From, Followers, Responses, #state{me=Me}=State) ->
     NextIndex = increment_follower_index(From, Followers),
     NewState = State#state{followers=dict:store(From, NextIndex, Followers),
                            responses=Responses},
-    LastLogIndex = rafter_log:get_last_index(?logname()),
+    LastLogIndex = rafter_log:get_last_index(Me),
     maybe_send_entry(From, NextIndex, LastLogIndex, NewState),
     NewState.
 
@@ -479,8 +479,8 @@ reconfig(Me, OldFollowers, Config0, NewServers, State) ->
     {Followers, Config}.
 
 -spec add_followers(list(), dict(), #state{}) -> dict().
-add_followers(NewServers, Followers, State) ->
-    NextIndex = rafter_log:get_last_index(?logname()) + 1,
+add_followers(NewServers, Followers, #state{me=Me}) ->
+    NextIndex = rafter_log:get_last_index(Me) + 1,
     NewFollowers = [{S, NextIndex} || S <- NewServers],
     dict:from_list(NewFollowers ++ dict:to_list(Followers)).
 
@@ -491,8 +491,8 @@ remove_followers(Servers, Followers0) ->
                 end, Followers0, Servers).
 
 -spec append(#rafter_entry{}, #state{}) -> #state{}.
-append(Entry, State) ->
-    {ok, _Index} = rafter_log:append(?logname(), [Entry]),
+append(Entry, #state{me=Me}=State) ->
+    {ok, _Index} = rafter_log:append(Me, [Entry]),
     send_append_entries(State),
     ok.
 
@@ -505,7 +505,7 @@ append(Id, From, Entry, State, leader) ->
 -spec append(binary(), term(), #rafter_entry{}, #state{}) -> #state{}.
 append(Id, From, Entry, 
        #state{me=Me, term=Term, client_reqs=Reqs}=State) ->
-    {ok, Index} = rafter_log:append(?logname(), [Entry]),
+    {ok, Index} = rafter_log:append(Me, [Entry]),
     {ok, Timer} = timer:send_after(?CLIENT_TIMEOUT, Me, {client_timeout, Id}),
     ClientRequest = #client_req{id=Id,
                                 from=From, 
@@ -557,11 +557,11 @@ delete_client_req_by_index(Index, ClientRequests) ->
 %%      client requests that these commits affect. Return the new state.
 -spec commit_entries(non_neg_integer(), #state{}) -> #state{}.
 commit_entries(NewCommitIndex, #state{commit_index=CommitIndex, 
-                                      state_machine=StateMachine}=State) ->
-   LastIndex = min(rafter_log:get_last_index(?logname()), NewCommitIndex),
+                                      state_machine=StateMachine, me=Me}=State) ->
+   LastIndex = min(rafter_log:get_last_index(Me), NewCommitIndex),
    lists:foldl(fun(Index, #state{client_reqs=CliReqs}=State1) ->
        NewState = State1#state{commit_index=Index},
-       case rafter_log:get_entry(?logname(), Index) of
+       case rafter_log:get_entry(Me, Index) of
 
            %% Normal Operation. Apply Command to StateMachine.
            {ok, #rafter_entry{type=op, cmd=Command}} ->
@@ -587,12 +587,12 @@ commit_entries(NewCommitIndex, #state{commit_index=CommitIndex,
    end, State, lists:seq(CommitIndex+1, LastIndex)).
 
 -spec stabilize_config(#config{}, #state{}) -> #state{}.
-stabilize_config(#config{state=transitional, newservers=New}=C, #state{term=Term}=S)
-    when S#state.leader =:= S#state.me ->
+stabilize_config(#config{state=transitional, newservers=New}=C, 
+    #state{me=Me, term=Term}=S) when S#state.leader =:= S#state.me ->
         Config = C#config{state=stable, oldservers=New, newservers=[]},
         Entry = #rafter_entry{type=config, term=Term, cmd=Config},
         State = S#state{config=Config},
-        {ok, _Index} = rafter_log:append(?logname(), [Entry]),
+        {ok, _Index} = rafter_log:append(Me, [Entry]),
         send_append_entries(State),
         State;
 stabilize_config(_, State) ->
@@ -630,12 +630,12 @@ commit(Responses, #state{me=Me,
             State
     end.
 
-safe_to_commit(Index, #state{term=CurrentTerm}=State) ->
-    CurrentTerm =:= rafter_log:get_term(?logname(), Index).
+safe_to_commit(Index, #state{term=CurrentTerm, me=Me}) ->
+    CurrentTerm =:= rafter_log:get_term(Me, Index).
 
 %% We are about to transition to the follower state. Reset the necessary state.
-step_down(NewTerm, State) ->
-    ok = rafter_log:set_metadata(?logname(), undefined, NewTerm),
+step_down(NewTerm, #state{me=Me}=State) ->
+    ok = rafter_log:set_metadata(Me, undefined, NewTerm),
     State#state{term=NewTerm,
                 responses=dict:new(),
                 timer_duration=election_timeout(),
@@ -652,12 +652,13 @@ save_responses({ok, _LastIndex}, Index, Responses, From) ->
 save_responses(error, Index, Responses, From) ->
     dict:store(From, Index, Responses).
 
-handle_request_vote(#request_vote{from=CandidateId, term=Term}=RequestVote, State) ->
+handle_request_vote(#request_vote{from=CandidateId, term=Term}=RequestVote, 
+  #state{me=Me}=State) ->
     State2 = set_term(Term, State),
     {ok, Vote} = vote(RequestVote, State2),
     case Vote#vote.success of
         true ->
-            ok = rafter_log:set_metadata(?logname(), CandidateId, State#state.term),
+            ok = rafter_log:set_metadata(Me, CandidateId, State#state.term),
             Duration = election_timeout(),
             State3 = State2#state{voted_for=CandidateId, 
                                   timer_duration=Duration, 
@@ -674,17 +675,16 @@ maybe_send_entry(Peer, Index, LastLogIndex, State)
         when LastLogIndex >= Index ->
     send_entry(Peer, Index, State).
 
-send_entry(Peer, Index, #state{me=Me, term=Term, commit_index=CIdx}=State) ->
-    Log = ?logname(),
+send_entry(Peer, Index, #state{me=Me, term=Term, commit_index=CIdx}) ->
     {PrevLogIndex, PrevLogTerm} = 
         case Index - 1 of
             0 -> 
                 {0, 0};
             PrevIndex ->
                 {PrevIndex,
-                  rafter_log:get_term(Log, PrevIndex)}
+                  rafter_log:get_term(Me, PrevIndex)}
         end,
-    Entries = case rafter_log:get_entry(Log, Index) of
+    Entries = case rafter_log:get_entry(Me, Index) of
                   {ok, not_found} -> 
                       [];
                   {ok, Entry} -> 
@@ -718,13 +718,12 @@ decrement_follower_index(From, Followers) ->
 %%      there is an error or a timeout no message is sent. This helps preserve
 %%      the asynchrnony of the consensus fsm, while maintaining the rpc 
 %%      semantics for the request_vote message as described in the raft paper.
-request_votes(#state{config=Config, term=Term, me=Me}=State) ->
+request_votes(#state{config=Config, term=Term, me=Me}) ->
     Voters = rafter_config:voters(Me, Config),
-    Log = ?logname(),
     Msg = #request_vote{term=Term,
                         from=Me,
-                        last_log_index=rafter_log:get_last_index(Log), 
-                        last_log_term=rafter_log:get_last_term(Log)},
+                        last_log_index=rafter_log:get_last_index(Me), 
+                        last_log_term=rafter_log:get_last_term(Me)},
     [rafter_requester:send(Peer, Msg) || Peer <- Voters].
 
 become_leader(#state{me=Me}=State) ->
@@ -734,9 +733,9 @@ become_leader(#state{me=Me}=State) ->
                 followers=initialize_followers(State),
                 timer_start=os:timestamp()}.
 
-initialize_followers(#state{me=Me, config=Config}=State) ->
+initialize_followers(#state{me=Me, config=Config}) ->
     Peers = rafter_config:followers(Me, Config),
-    NextIndex = rafter_log:get_last_index(?logname()) + 1,
+    NextIndex = rafter_log:get_last_index(Me) + 1,
     Followers = [{Peer, NextIndex} || Peer <- Peers],
     dict:from_list(Followers).
 
@@ -745,8 +744,8 @@ consistency_check(#append_entries{prev_log_index=0,
                                   prev_log_term=0}, _State) ->
     true;
 consistency_check(#append_entries{prev_log_index=Index, 
-                                  prev_log_term=Term}, State) ->
-    case rafter_log:get_entry(?logname(), Index) of
+                                  prev_log_term=Term}, #state{me=Me}) ->
+    case rafter_log:get_entry(Me, Index) of
         {ok, not_found} ->
             false;
         {ok, #rafter_entry{term=Term}} ->
@@ -757,8 +756,8 @@ consistency_check(#append_entries{prev_log_index=Index,
 
 set_term(Term, #state{term=CurrentTerm}=State) when Term < CurrentTerm ->
     State;
-set_term(Term, #state{term=CurrentTerm}=State) when Term > CurrentTerm ->
-    ok = rafter_log:set_metadata(?logname(), undefined, CurrentTerm),
+set_term(Term, #state{term=CurrentTerm, me=Me}=State) when Term > CurrentTerm ->
+    ok = rafter_log:set_metadata(Me, undefined, CurrentTerm),
     State#state{term=Term, voted_for=undefined};
 set_term(Term, #state{term=Term}=State) ->
     State.
@@ -786,12 +785,12 @@ maybe_successful_vote(RequestVote, CurrentTerm, Me, State) ->
     end.
 
 candidate_log_up_to_date(#request_vote{last_log_term=CandidateTerm,
-                                       last_log_index=CandidateIndex}, State) ->
-    Log = ?logname(),
+                                       last_log_index=CandidateIndex}, 
+                         #state{me=Me}) ->
     candidate_log_up_to_date(CandidateTerm, 
                              CandidateIndex, 
-                             rafter_log:get_last_term(Log), 
-                             rafter_log:get_last_index(Log)).
+                             rafter_log:get_last_term(Me), 
+                             rafter_log:get_last_index(Me)).
             
 candidate_log_up_to_date(CandidateTerm, _CandidateIndex, LogTerm, _LogIndex)
     when CandidateTerm > LogTerm ->
@@ -813,11 +812,6 @@ successful_vote(CurrentTerm, Me) ->
 
 fail_vote(CurrentTerm, Me) ->
     {ok, #vote{term=CurrentTerm, success=false, from=Me}}.
-
-logname({Name, _Node}) ->
-    list_to_atom(atom_to_list(Name) ++ "_log");
-logname(Me) ->
-    list_to_atom(atom_to_list(Me) ++ "_log").
 
 timeout(StartTime, Duration) ->
     case Duration - (timer:now_diff(os:timestamp(), StartTime) div 1000) of

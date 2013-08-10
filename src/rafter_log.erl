@@ -5,13 +5,12 @@
 -include_lib("kernel/include/file.hrl").
 
 -include("rafter.hrl").
+-include("rafter_opts.hrl").
 
 %% API
--export([start_link/1, stop/1, append/1, append/2, binary_to_entry/1, entry_to_binary/1,
-        get_last_entry/0, get_last_entry/1, get_entry/1, get_entry/2,
-        get_term/1, get_term/2, get_last_index/0, get_last_index/1, 
-        get_last_term/0, get_last_term/1, truncate/1, truncate/2,
-        get_config/1, set_metadata/3]).
+-export([start_link/2, stop/1, append/2, binary_to_entry/1, entry_to_binary/1,
+        get_last_entry/1, get_entry/2, get_term/2, get_last_index/1, 
+        get_last_term/1, truncate/2, get_config/1, set_metadata/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -112,88 +111,56 @@ binary_to_entry(?CONFIG, Term, Index, Data) ->
 binary_to_entry(?OP, Term, Index, Data) ->
     #rafter_entry{type=op, term=Term, index=Index, cmd=binary_to_term(Data)}.
 
-start_link(Name) ->
-    gen_server:start_link({local, Name}, ?MODULE, [Name], []).
+start_link(Peer, Opts) ->
+    gen_server:start_link({local, logname(Peer)}, ?MODULE, [Peer, Opts], []).
 
-stop(Name) ->
-    gen_server:cast(Name, stop).
+stop(Peer) ->
+    gen_server:cast(logname(Peer), stop).
 
-append(Entries) ->
-    gen_server:call(?MODULE, {append, Entries}).
+append(Peer, Entries) ->
+    gen_server:call(logname(Peer), {append, Entries}).
 
-append(Name, Entries) ->
-    gen_server:call(Name, {append, Entries}).
+get_config(Peer) ->
+    gen_server:call(logname(Peer), get_config).
 
-get_config(Name) ->
-    gen_server:call(Name, get_config).
+get_last_index(Peer) ->
+    gen_server:call(logname(Peer), get_last_index).
 
-get_last_index() ->
-    gen_server:call(?MODULE, get_last_index).
+get_last_entry(Peer) ->
+    gen_server:call(logname(Peer), get_last_entry).
 
-get_last_index(Name) ->
-    gen_server:call(Name, get_last_index).
-
-get_last_entry() ->
-    gen_server:call(?MODULE, get_last_entry).
-
-get_last_entry(Name) ->
-    gen_server:call(Name, get_last_entry).
-
-get_last_term() ->
-    case get_last_entry() of
+get_last_term(Peer) ->
+    case get_last_entry(Peer) of
         {ok, #rafter_entry{term=Term}} ->
             Term;
         {ok, not_found} ->
             0
     end.
 
-get_last_term(Name) ->
-    case get_last_entry(Name) of
+set_metadata(Peer, VotedFor, Term) ->
+    gen_server:call(logname(Peer), {set_metadata, VotedFor, Term}).
+
+get_entry(Peer, Index) ->
+    gen_server:call(logname(Peer), {get_entry, Index}).
+
+get_term(Peer, Index) ->
+    case get_entry(Peer, Index) of
         {ok, #rafter_entry{term=Term}} ->
             Term;
         {ok, not_found} ->
             0
     end.
 
-set_metadata(Name, VotedFor, Term) ->
-    gen_server:call(Name, {set_metadata, VotedFor, Term}).
-
-get_entry(Index) ->
-    gen_server:call(?MODULE, {get_entry, Index}).
-
-get_entry(Name, Index) ->
-    gen_server:call(Name, {get_entry, Index}).
-
-get_term(Index) ->
-    case get_entry(Index) of
-        {ok, #rafter_entry{term=Term}} ->
-            Term;
-        {ok, not_found} ->
-            0
-    end.
-
-get_term(Name, Index) ->
-    case get_entry(Name, Index) of
-        {ok, #rafter_entry{term=Term}} ->
-            Term;
-        {ok, not_found} ->
-            0
-    end.
-
-truncate(Index) ->
-    gen_server:call(?MODULE, {truncate, Index}).
-
-truncate(Name, Index) ->
-    gen_server:call(Name, {truncate, Index}).
+truncate(Peer, Index) ->
+    gen_server:call(logname(Peer), {truncate, Index}).
 
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
 
-init([Name]) ->
-    %% TODO: fix this path 
-    LogName = "log/rafter_"++atom_to_list(Name)++".log",
-    MetaName = "log/rafter_"++atom_to_list(Name)++".meta",
+init([Name, #rafter_opts{logdir = Logdir}]) ->
+    LogName = Logdir++"/rafter_"++atom_to_list(Name)++".log",
+    MetaName = Logdir++"/rafter_"++atom_to_list(Name)++".meta",
     {ok, LogFile} = file:open(LogName, [append, read, binary, raw]),
     {ok, #file_info{size=Size}} = file:read_file_info(LogName),
     {ok, Meta} = read_metadata(MetaName, Size),
@@ -278,6 +245,11 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Functions 
 %%====================================================================
 
+logname({Name, _Node}) ->
+    list_to_atom(atom_to_list(Name) ++ "_log");
+logname(Me) ->
+    list_to_atom(atom_to_list(Me) ++ "_log").
+
 init_file(File, 0) ->
     {ok, Loc} = write_file_header(File),
     {0, #config{}, 0, 0, Loc, ?LATEST_VERSION};
@@ -329,6 +301,8 @@ read_config(File, Loc) ->
     #rafter_entry{type=config, cmd=Config} = binary_to_entry(Data),
     {ok, Config}.
 
+%% TODO: Write to a tmp file then rename so the write is always atomic and the 
+%% metadata file cannot become partially written.
 write_metadata(Filename, Meta) ->
     ok = file:write_file(Filename, term_to_binary(Meta)).
 
