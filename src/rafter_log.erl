@@ -183,9 +183,9 @@ format_status(_, [_, State]) ->
 
 handle_call({append, Entries}, _From, 
             #state{logfile=File, config=C, config_loc=CLoc, index=I, 
-                   write_location=Loc}=State) ->
+                   write_location=Loc, last_entry=LE}=State) ->
     {NewLoc, Index, LastEntry, ConfigLoc, Config} 
-        = write_entries(File, Entries, Loc, CLoc, C, I),
+        = write_entries(File, Entries, Loc, CLoc, C, I, LE),
     NewState = State#state{index=Index, 
                            config=Config, 
                            config_loc=ConfigLoc,
@@ -277,7 +277,7 @@ make_trailer(EntryStart, ConfigStart) ->
     Crc = erlang:crc32(T),
     <<Crc:32, T/binary>>.
 
-write_entries(File, Entries, Location, ConfigLoc, Config0, Index) ->
+write_entries(File, Entries, Location, ConfigLoc, Config0, Index, LastEntry) ->
     Res = lists:foldl(fun(#rafter_entry{type=Type, cmd=Cmd}=E, {Loc, I, _, CLoc, C}) ->
         NewIndex = I + 1,
         Entry0 = E#rafter_entry{index=NewIndex}, 
@@ -292,7 +292,7 @@ write_entries(File, Entries, Location, ConfigLoc, Config0, Index) ->
         ok = file:write(File, <<Entry/binary, Trailer/binary>>),
         NewLoc = Loc + byte_size(Entry) + ?TRAILER_SIZE,
         {NewLoc, NewIndex, Entry0, NewConfigLoc, Config}
-    end, {Location, Index, undefined, ConfigLoc, Config0}, Entries),
+    end, {Location, Index, LastEntry, ConfigLoc, Config0}, Entries),
     ok = file:sync(File),
     Res.
 
@@ -410,7 +410,7 @@ get_pos(File, Loc, Index) ->
     case file:pread(File, Loc, ?HEADER_SIZE) of
         {ok, <<_Sha1:20/binary, _Type:8, _Term:64, Index:64, _DataSize:32>>} ->
             Loc;
-        {ok, <<_, _, _, _, DataSize:32>>} ->
+        {ok, <<_:37/binary, DataSize:32>>} ->
             get_pos(File, Loc + ?HEADER_SIZE + DataSize + ?TRAILER_SIZE, Index)
     end.
 

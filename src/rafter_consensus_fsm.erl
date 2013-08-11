@@ -385,19 +385,19 @@ leader(#append_entries_rpy{from=From, success=true, index=Index},
        #state{followers=Followers, responses=Responses, config=C, me=Me}=State) ->
     case lists:member(From, rafter_config:followers(Me, C)) of
         true ->
-            case save_responses(dict:find(From, Responses), Index, Responses, From) of
-                %% Duplicate Index Received 
-                Responses ->
-                    {next_state, leader, State, ?timeout()};
-                NewResponses ->
-                    State2 = commit(NewResponses, State),
-                    case State2#state.leader of
-                        undefined ->
-                            %% We just committed a config that doesn't include ourselves
-                            {next_state, follower, State2, ?timeout()};
+            NewResponses = save_responses(dict:find(From, Responses), Index, Responses, From),
+            State2 = commit(NewResponses, State),
+            case State2#state.leader of
+                undefined ->
+                    %% We just committed a config that doesn't include ourselves
+                    {next_state, follower, State2, ?timeout()};
+                _ ->
+                    case NewResponses of
+                        Responses ->
+                            {next_state, leader, State2, ?timeout()};
                         _ ->
                             State3 = send_next_entry(From, Followers, 
-                                                     NewResponses, State2),
+                                NewResponses, State2),
                             {next_state, leader, State3, ?timeout()}
                     end
             end;
