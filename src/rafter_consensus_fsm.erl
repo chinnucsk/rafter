@@ -70,7 +70,7 @@ send_sync(To, Msg) ->
 init([Me, #rafter_opts{state_machine=StateMachine}]) ->
     random:seed(),
     Duration = election_timeout(),
-    Meta = #meta{voted_for=VotedFor, term=Term} = rafter_log:get_metadata(Me),
+    #meta{voted_for=VotedFor, term=Term} = rafter_log:get_metadata(Me),
     State = #state{term=Term,
                    voted_for=VotedFor,
                    me=Me, 
