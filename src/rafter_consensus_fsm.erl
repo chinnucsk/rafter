@@ -70,7 +70,9 @@ send_sync(To, Msg) ->
 init([Me, #rafter_opts{state_machine=StateMachine}]) ->
     random:seed(),
     Duration = election_timeout(),
-    State = #state{term=0,
+    Meta = #meta{voted_for=VotedFor, term=Term} = rafter_log:get_metadata(Me),
+    State = #state{term=Term,
+                   voted_for=VotedFor,
                    me=Me, 
                    responses=dict:new(),
                    followers=dict:new(),
@@ -666,7 +668,7 @@ handle_request_vote(#request_vote{from=CandidateId, term=Term}=RequestVote,
     {ok, Vote} = vote(RequestVote, State2),
     case Vote#vote.success of
         true ->
-            ok = rafter_log:set_metadata(Me, CandidateId, State#state.term),
+            ok = rafter_log:set_metadata(Me, CandidateId, State2#state.term),
             Duration = election_timeout(),
             State3 = State2#state{voted_for=CandidateId, 
                                   timer_duration=Duration, 
@@ -765,7 +767,7 @@ consistency_check(#append_entries{prev_log_index=Index,
 set_term(Term, #state{term=CurrentTerm}=State) when Term < CurrentTerm ->
     State;
 set_term(Term, #state{term=CurrentTerm, me=Me}=State) when Term > CurrentTerm ->
-    ok = rafter_log:set_metadata(Me, undefined, CurrentTerm),
+    ok = rafter_log:set_metadata(Me, undefined, Term),
     State#state{term=Term, voted_for=undefined};
 set_term(Term, #state{term=Term}=State) ->
     State.

@@ -39,6 +39,10 @@
         index :: non_neg_integer(),
         cmd :: term()}).
 
+-record(meta, {
+    voted_for :: peer(),
+    term = 0 :: non_neg_integer()}).
+
 -record(config, {
     state = blank :: 
         %% The configuration specifies no servers. Servers that are new to the

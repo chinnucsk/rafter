@@ -10,7 +10,8 @@
 %% API
 -export([start_link/2, stop/1, append/2, check_and_append/3, binary_to_entry/1,
         entry_to_binary/1,get_last_entry/1, get_entry/2, get_term/2, 
-        get_last_index/1, get_last_term/1, get_config/1, set_metadata/3]).
+        get_last_index/1, get_last_term/1, get_config/1, set_metadata/3, 
+        get_metadata/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -55,10 +56,6 @@
 %%                  the following magic number as the last 8 bytes:
 %%                  <<"\xFE\xED\xFE\xED\xFE\xED\xFE\xED">>
 %%
-
--record(meta, {
-    voted_for :: peer(),
-    term :: non_neg_integer()}).
 
 -record(state, {
     logfile :: file:io_device(),
@@ -145,6 +142,9 @@ get_last_term(Peer) ->
             0
     end.
 
+get_metadata(Peer) ->
+    gen_server:call(logname(Peer), get_metadata).
+
 set_metadata(Peer, VotedFor, Term) ->
     gen_server:call(logname(Peer), {set_metadata, VotedFor, Term}).
 
@@ -207,6 +207,9 @@ handle_call(get_last_entry, _From, #state{last_entry=LastEntry}=State) ->
 handle_call(get_last_index, _From, #state{index=Index}=State) ->
     {reply, Index, State};
 
+handle_call(get_metadata, _, #state{meta=Meta}=State) ->
+    {reply, Meta, State};
+
 handle_call({set_metadata, VotedFor, Term}, _, #state{meta_filename=Name}=S) ->
     Meta = #meta{voted_for=VotedFor, term=Term},
     ok = write_metadata(Name, Meta),
@@ -245,13 +248,16 @@ maybe_append(Index, eof, [Entry | Entries], State) ->
 maybe_append(Index, Loc, [#rafter_entry{term=Term}=Entry | Entries], 
              State=#state{logfile=File}) ->
     case read_entry(File, Loc) of
-        {entry, #rafter_entry{index=Index, term=Term}, NewLocation} ->
-            maybe_append(Index+1, NewLocation, Entries, State);
-        {entry, #rafter_entry{index=Index, term=_}, _} ->
-            truncate(File, Loc),
-            State1 = State#state{write_location=Loc},
-            State2 = write_entry(Entry, State1),
-            maybe_append(Index + 1, eof, Entries, State2);
+        {entry, Data, NewLocation} ->
+            case binary_to_entry(Data) of
+                #rafter_entry{index=Index, term=Term} ->
+                    maybe_append(Index+1, NewLocation, Entries, State);
+                #rafter_entry{index=Index, term=_} ->
+                    truncate(File, Loc),
+                    State1 = State#state{write_location=Loc},
+                    State2 = write_entry(Entry, State1),
+                    maybe_append(Index + 1, eof, Entries, State2)
+            end;
         eof ->
             truncate(File, Loc),
             State1 = State#state{write_location=Loc},
