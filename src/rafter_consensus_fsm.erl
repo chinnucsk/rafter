@@ -145,6 +145,7 @@ follower(#append_entries{term=Term}, _From,
          #state{term=CurrentTerm, me=Me}=State) when CurrentTerm > Term ->
     Rpy = #append_entries_rpy{from=Me, term=CurrentTerm, success=false},
     {reply, Rpy, follower, State, ?timeout()};
+    
 follower(#append_entries{term=Term, from=From, prev_log_index=PrevLogIndex, 
                          entries=Entries, commit_index=CommitIndex}=AppendEntries,
          _From, #state{me=Me}=State) ->
@@ -156,8 +157,9 @@ follower(#append_entries{term=Term, from=From, prev_log_index=PrevLogIndex,
         false ->
             {reply, Rpy, follower, State3, Duration};
         true ->
-            ok = rafter_log:truncate(Me, PrevLogIndex),
-            {ok, CurrentIndex}  = rafter_log:append(Me, Entries),
+            {ok, CurrentIndex} = rafter_log:check_and_append(Me, 
+                                                             Entries, 
+                                                             PrevLogIndex+1),
             Config = rafter_log:get_config(Me),
             NewRpy = Rpy#append_entries_rpy{success=true, index=CurrentIndex},
             State4 = commit_entries(CommitIndex, State3),
@@ -555,11 +557,17 @@ delete_client_req_by_index(Index, ClientRequests) ->
 %% @doc Commit entries between the previous commit index and the new one.
 %%      Apply them to the local state machine and respond to any outstanding
 %%      client requests that these commits affect. Return the new state.
+%%      Ignore already committed entries.
 -spec commit_entries(non_neg_integer(), #state{}) -> #state{}.
+commit_entries(NewCommitIndex, #state{commit_index=CommitIndex}=State)
+        when CommitIndex >= NewCommitIndex -> 
+    State;
 commit_entries(NewCommitIndex, #state{commit_index=CommitIndex, 
                                       state_machine=StateMachine, me=Me}=State) ->
    LastIndex = min(rafter_log:get_last_index(Me), NewCommitIndex),
    lists:foldl(fun(Index, #state{client_reqs=CliReqs}=State1) ->
+       io:format("FOLD: Last Index = ~p, CommitIndex = ~p, me = ~p~n", 
+           [LastIndex, Index, Me]),
        NewState = State1#state{commit_index=Index},
        case rafter_log:get_entry(Me, Index) of
 

@@ -8,9 +8,9 @@
 -include("rafter_opts.hrl").
 
 %% API
--export([start_link/2, stop/1, append/2, binary_to_entry/1, entry_to_binary/1,
-        get_last_entry/1, get_entry/2, get_term/2, get_last_index/1, 
-        get_last_term/1, truncate/2, get_config/1, set_metadata/3]).
+-export([start_link/2, stop/1, append/2, check_and_append/3, binary_to_entry/1,
+        entry_to_binary/1,get_last_entry/1, get_entry/2, get_term/2, 
+        get_last_index/1, get_last_term/1, get_config/1, set_metadata/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -117,6 +117,14 @@ start_link(Peer, Opts) ->
 stop(Peer) ->
     gen_server:cast(logname(Peer), stop).
 
+%% @doc check_and_append/3 gets called in the follower state only and will only 
+%% truncate the log if entries don't match. It never truncates and re-writes 
+%% committed entries as this violates the safety of the RAFT protocol.
+check_and_append(Peer, Entries, Index) ->
+    gen_server:call(logname(Peer), {check_and_append, Entries, Index}).
+
+%% @doc append/2 gets called in the leader state only, and assumes a
+%% truncated log.
 append(Peer, Entries) ->
     gen_server:call(logname(Peer), {append, Entries}).
 
@@ -151,9 +159,6 @@ get_term(Peer, Index) ->
             0
     end.
 
-truncate(Peer, Index) ->
-    gen_server:call(logname(Peer), {truncate, Index}).
-
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -181,16 +186,14 @@ format_status(_, [_, State]) ->
     Data = lager:pr(State, ?MODULE),
     [{data, [{"StateData", Data}]}].
 
-handle_call({append, Entries}, _From, 
-            #state{logfile=File, config=C, config_loc=CLoc, index=I, 
-                   write_location=Loc, last_entry=LE}=State) ->
-    {NewLoc, Index, LastEntry, ConfigLoc, Config} 
-        = write_entries(File, Entries, Loc, CLoc, C, I, LE),
-    NewState = State#state{index=Index, 
-                           config=Config, 
-                           config_loc=ConfigLoc,
-                           write_location=NewLoc,
-                           last_entry=LastEntry},
+handle_call({check_and_append, Entries, Index}, _From, #state{logfile=File}=S) ->
+    Loc = get_pos(File, Index),
+    #state{index=NewIndex}=NewState = maybe_append(Index, Loc, Entries, S),
+    {reply, {ok, NewIndex}, NewState};
+
+handle_call({append, Entries}, _From, #state{logfile=File}=State) ->
+    NewState = write_entries(File, Entries, State),
+    Index = NewState#state.index,
     {reply, {ok, Index}, NewState};
 
 handle_call(get_config, _From, #state{config=Config}=State) ->
@@ -212,18 +215,7 @@ handle_call({set_metadata, VotedFor, Term}, _, #state{meta_filename=Name}=S) ->
 %% This always starts searching from the head of the log. Todo: Be smarter.
 handle_call({get_entry, Index}, _From, #state{logfile=File}=State) ->
     Res = find_entry(File, ?FILE_HEADER_SIZE, Index),
-    {reply, {ok, Res}, State};
-
-handle_call({truncate, Index}, _From, #state{index=Index}=State) ->
-    {reply, ok, State};
-handle_call({truncate, Index}, _From, #state{index=CurrentIndex}=State) 
-        when Index > CurrentIndex ->
-    {reply, {error, bad_index}, State};
-handle_call({truncate, Index}, _From, #state{logfile=File}=State) ->
-    Loc = get_pos(File, Index),
-    ok = do_truncate(File, Loc),
-    NewState = State#state{write_location=Loc},
-    {reply, ok, NewState}.
+    {reply, {ok, Res}, State}.
 
 handle_cast(stop, #state{logfile=File}=State) ->
     ok = file:close(File),
@@ -245,6 +237,28 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Functions 
 %%====================================================================
 
+maybe_append(_, _, [], State) ->
+    State;
+maybe_append(Index, eof, [Entry | Entries], State) ->
+    NewState = write_entry(Entry, State),
+    maybe_append(Index+1, eof, Entries, NewState);
+maybe_append(Index, Loc, [#rafter_entry{term=Term}=Entry | Entries], 
+             State=#state{logfile=File}) ->
+    case read_entry(File, Loc) of
+        {entry, #rafter_entry{index=Index, term=Term}, NewLocation} ->
+            maybe_append(Index+1, NewLocation, Entries, State);
+        {entry, #rafter_entry{index=Index, term=_}, _} ->
+            truncate(File, Loc),
+            State1 = State#state{write_location=Loc},
+            State2 = write_entry(Entry, State1),
+            maybe_append(Index + 1, eof, Entries, State2);
+        eof ->
+            truncate(File, Loc),
+            State1 = State#state{write_location=Loc},
+            State2 = write_entry(Entry, State1),
+            maybe_append(Index+1, eof, Entries, State2)
+    end.
+         
 logname({Name, _Node}) ->
     list_to_atom(atom_to_list(Name) ++ "_log");
 logname(Me) ->
@@ -277,24 +291,33 @@ make_trailer(EntryStart, ConfigStart) ->
     Crc = erlang:crc32(T),
     <<Crc:32, T/binary>>.
 
-write_entries(File, Entries, Location, ConfigLoc, Config0, Index, LastEntry) ->
-    Res = lists:foldl(fun(#rafter_entry{type=Type, cmd=Cmd}=E, {Loc, I, _, CLoc, C}) ->
-        NewIndex = I + 1,
-        Entry0 = E#rafter_entry{index=NewIndex}, 
-        Entry = entry_to_binary(Entry0),
-        {NewConfigLoc, Config, Trailer} = 
-            case Type of 
-                config ->
-                    {Loc, Cmd, make_trailer(Loc, Loc)};
-                _ ->
-                    {CLoc, C, make_trailer(Loc, ConfigLoc)}
-            end,
-        ok = file:write(File, <<Entry/binary, Trailer/binary>>),
-        NewLoc = Loc + byte_size(Entry) + ?TRAILER_SIZE,
-        {NewLoc, NewIndex, Entry0, NewConfigLoc, Config}
-    end, {Location, Index, LastEntry, ConfigLoc, Config0}, Entries),
+write_entries(File, Entries, State) ->
+    NewState = lists:foldl(fun write_entry/2, State, Entries),
     ok = file:sync(File),
-    Res.
+    NewState.
+
+write_entry(#rafter_entry{type=Type, cmd=Cmd}=Entry, S=#state{write_location=Loc,
+                                                              config=Config,
+                                                              config_loc=ConfigLoc,
+                                                              index=Index,
+                                                              logfile=File}) ->
+    NewIndex = Index + 1,
+    NewEntry = Entry#rafter_entry{index=NewIndex}, 
+    BinEntry = entry_to_binary(NewEntry),
+    {NewConfigLoc, NewConfig, Trailer} = 
+    case Type of 
+        config ->
+            {Loc, Cmd, make_trailer(Loc, Loc)};
+        _ ->
+            {ConfigLoc, Config, make_trailer(Loc, ConfigLoc)}
+    end,
+    ok = file:write(File, <<BinEntry/binary, Trailer/binary>>),
+    NewLoc = Loc + byte_size(BinEntry) + ?TRAILER_SIZE,
+    S#state{index=NewIndex,
+            config=NewConfig,
+            write_location=NewLoc,
+            config_loc=NewConfigLoc,
+            last_entry=NewEntry}.
 
 read_config(File, Loc) ->
     {entry, Data, _} = read_entry(File, Loc),
@@ -318,14 +341,14 @@ read_metadata(Filename, FileSize) ->
             {ok, #meta{}}
     end.
 
-do_truncate(File, Pos) ->
+truncate(File, Pos) ->
     file:position(File, Pos),
     file:truncate(File).
 
 maybe_truncate(File, TruncateAt, FileSize) ->
     case TruncateAt < FileSize of
         true ->
-            ok = do_truncate(File, TruncateAt);
+            ok = truncate(File, TruncateAt);
         false ->
             ok
     end.
@@ -333,15 +356,13 @@ maybe_truncate(File, TruncateAt, FileSize) ->
 repair_file(File, Size) ->
     case scan_for_trailer(File, Size) of
         {ok, ConfigStart, EntryStart, TruncateAt} ->
-            io:format("AYO, maybe truncate?~n", []),
-            io:format("ConfigStart = ~p, EntryStart = ~p, TruncateAt = ~p~n", [ConfigStart, EntryStart, TruncateAt]),
             maybe_truncate(File, TruncateAt, Size),
             {entry, Data, _} = read_entry(File, EntryStart),
             #rafter_entry{term=Term, index=Index} = binary_to_entry(Data), 
             {ok, ConfigStart, Term, Index, TruncateAt};
         not_found ->
             io:format("NOT FOUND: Size = ~p~n", [Size]),
-            do_truncate(File, 0),
+            truncate(File, 0),
             empty_file
     end.
 
@@ -411,7 +432,9 @@ get_pos(File, Loc, Index) ->
         {ok, <<_Sha1:20/binary, _Type:8, _Term:64, Index:64, _DataSize:32>>} ->
             Loc;
         {ok, <<_:37/binary, DataSize:32>>} ->
-            get_pos(File, Loc + ?HEADER_SIZE + DataSize + ?TRAILER_SIZE, Index)
+            get_pos(File, Loc + ?HEADER_SIZE + DataSize + ?TRAILER_SIZE, Index);
+        eof ->
+            eof
     end.
 
 %% @doc Find an entry at the given index in a file. Search forward from Loc.
